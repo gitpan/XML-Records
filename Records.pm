@@ -1,7 +1,7 @@
 package XML::Records;
 use strict;
 use vars qw($VERSION);
-$VERSION = '0.11';
+$VERSION = '0.12';
 
 use base 'XML::TokeParser';
 
@@ -91,7 +91,7 @@ sub get_simple_tree {
   my $lists=[];
   my $tree=[];
   my $curlist=$tree;
-  my $top='';
+  my $ecount=0;
   while (my $token=$self->get_token()) {
     my $type=$token->[0];
     if ($type eq 'S') {
@@ -100,11 +100,11 @@ sub get_simple_tree {
       push @$lists, $curlist;
       push @$curlist,$newnode;
       $curlist=$newlist;
-      $top||=$token->[1];
+      ++$ecount;
     }
     elsif ($type eq 'E') {
       $curlist=pop @$lists;
-      last if $token->[1] eq $top;
+      last if --$ecount==0;
     }
     elsif ($type eq 'T') {
       push @$curlist,{type=>'t',content=>$token->[1]};
@@ -124,17 +124,17 @@ sub drive_SAX {
     $wrap=$_[0]->{wrap};
   }
   return undef unless ($self->skip_to(@_));
-  my $top='';
+  my $ecount=0;
   $handler->start_document({}) if $wrap;
   while (my $token=$self->get_token()) {
     my $type=$token->[0];
     if ($type eq 'S') {
       $handler->start_element({Attributes=>$token->[2],Name=>$token->[1]});
-      $top||=$token->[1];
+      ++$ecount;
     }
     elsif ($type eq 'E') {
       $handler->end_element({Name=>$token->[1]});
-      last if $token->[1] eq $top;
+      last if --$ecount==0;
     }
     elsif ($type eq 'T') {
       $handler->characters({Data=>$token->[1]});
@@ -292,6 +292,9 @@ data value for processing instruction nodes.  Element nodes also have an
 values.  Processing instructions also have a 'target' key whose value is 
 the PI's target.
 
+This method is deprecated; future code should instantiate an XML::Handler::EasyTree
+object from the XML::Handler::Trees module and call drive_SAX (see below) on it.
+
 =item $result=$parser->drive_SAX(handler, [{options},[name [,name]*]);
 
 Skips to the next element whose names is listed in the arguments, or the 
@@ -303,6 +306,8 @@ undef without generating any SAX events if the next non-comment token is
 not a start tag for a record-enclosing element.  If the 'wrap' option is 
 set to 0, does not generate start_document or end_document events and 
 returns 1.
+
+At the present time, only SAX1 is supported.
 
 =back
 
