@@ -8,3 +8,6 @@ Revision history for Perl extension XML::Records.
 	- added get_simple_tree and drive_SAX methods
 	- added 'here' option
 
+0.11  Mon Nov 05 10:00:00 2001
+	- attributes on field elements are now returned in record structure
+

@@ -1,7 +1,7 @@
 package XML::Records;
 use strict;
 use vars qw($VERSION);
-$VERSION = '0.10';
+$VERSION = '0.11';
 
 use base 'XML::TokeParser';
 
@@ -66,7 +66,9 @@ sub get_hash {
     elsif ($t eq 'E') {
       last if $token->[1] eq $rectype;
       add_hash($h,$field,$buf);
-      --$nest;
+      if (--$nest==0 && keys %{$field_token->[2]}) {
+        add_hash($h,$field,{%{$field_token->[2]}});
+      }
     }
   }
   $h;
@@ -251,7 +253,10 @@ values are the fields' contents (if called in scalar context, the return
 value will be the hash reference).  Both elements of the list will be undef 
 if no record can be found.
 
-If a field's content is plain text, its value will be that text.
+If a field's content is plain text, its value will be that text.  If a field element
+has attributes, its value will be a reference to an array whose first element is the
+field's (possibly empty) text value and whose second element is a reference to a hash
+of the attributes and their values.
 
 If a field's content contains another element (e.g. a <customer> record 
 contains an <address> field that in turn contains other fields), its value 
@@ -261,9 +266,8 @@ If a record includes repeated fields, the hash entry for that field's
 name will be a reference to an array of field values.
 
 Attributes of record or sub-record elements are treated as if they were 
-fields.  Attributes of field elements are ignored.  Mixed content (fields 
-with both non-whitespace text and sub-elements) will lead to unpredictable 
-results.
+fields.  Mixed content (fields with both non-whitespace text and sub-elements)
+will lead to unpredictable results.
 
 Records do not actually need to be immediately below the document 
 root.  If a <customers> document consists of a sequence of <customer> 
