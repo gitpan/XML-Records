@@ -1,98 +1,70 @@
 package XML::Records;
 use strict;
 use vars qw($VERSION);
-$VERSION = '0.01';
+$VERSION = '0.10';
 
-use Carp;
-use IO::File;
-use XML::Parser;
+use base 'XML::TokeParser';
 
 sub new {
   my $class=shift;
-  my $source=shift;
-  my %args=(Latin=>0,Catalog=>0,@_);
-  my $self={output=>[],EOF=>0,rectypes=>{}};
-  $self->{latin}=delete $args{Latin};
-  my $catname=delete $args{Catalog};
-  my $parser=XML::Parser->new(%args) or croak "$!";
-  $parser->setHandlers(Start=>\&start,End=>\&end,Char=>\&char);
-  if ($catname) {
-    require XML::Catalog;
-    my $catalog=XML::Catalog->new($catname) or croak "$!";
-    $parser->setHandlers(ExternEnt=>$catalog->get_handler($parser));
-  }
-  $self->{parser}=$parser->parse_start(Records=>$self) or croak "$!";  
-  if (ref($source) eq 'SCALAR') {
-    $self->{src}=$source;
-    $self->{src_offset}=0;
-  }
-  elsif (ref($source)=~/^IO:|^GLOB$/) {
-    $self->{srcfile}=$source;
-  }
-  else {
-    $self->{srcfile}=IO::File->new($source,'r') or return undef;
-    $self->{opened}=1;
-  }
+  $class=ref $class || $class;
+  my $self=$class->SUPER::new(@_);
+  $self->{rectypes}=[{}];
   bless $self,$class;
-}
-
-sub DESTROY {
-  my $self=shift;
-  $self->{srcfile}->close() if $self->{opened};
-  $self->{parser}=undef;
 }
 
 sub set_records {
   my $self=shift;
-  $self->{rectypes}={map {$_=>1} @_};
+  $self->{rectypes}[-1]={map {$_=>1} @_};
 }
 
 sub get_record {
   my $self=shift;
   my ($rec,$rectype);
-  $self->{saverectypes}=$self->{rectypes};
-  $self->set_records(@_) if @_;
-  while (my $evt=$self->next_evt()) {
-    next unless $evt->[0] eq 's';
-    my $rt=$evt->[1];
-    next unless $self->{rectypes}{$rt};
-    $rec=$self->get_hash($evt);
-    $rectype=$rt;
-    last;
+  if ($self->skip_to(@_)) {
+    my $token=$self->get_token();
+    $rectype=$token->[1];
+    my $t=$self->{noempty};
+    $self->{noempty}=1;
+    $rec=$self->get_hash($token);
+    $self->{noempty}=$t;
   }
-  $self->{rectypes}=$self->{saverectypes};
   ($rectype,$rec);
 }
 
 sub get_hash {
-  my ($self,$evt)=@_;
-  my ($field,$buf,$field_evt);
-  my $rectype=$evt->[1];
+  my ($self,$token)=@_;
+  my ($field,$buf,$field_token);
+  my $rectype=$token->[1];
   my $nest=0;
   my $h={};
   # treat attributes of record or subrecord as fields
-  for (my $i=2; $i<@$evt; $i+=2) {
-    $h->{$evt->[$i]}=$evt->[$i+1];
+  foreach (keys %{$token->[2]}) {
+    $h->{$_}=$token->[2]{$_};
   }
-  while ($evt=$self->next_evt()) {
-    my $t=$evt->[0];
-    if ($t eq 's') {
+  while ($token=$self->get_token()) {
+    my $t=$token->[0];
+    if ($t eq 'S') {
+      if ($self->{rectypes}[-1]{"-$token->[1]"}) { # record ended by start
+        $self->unget_token($token);
+        last;
+      }
       if ($nest++) { # start tag inside field, get subrecord
-        $self->pushback($evt);
-        add_hash($h,$field,$self->get_hash($field_evt));
+        $self->unget_token($token);
+        add_hash($h,$field,$self->get_hash($field_token));
         $nest-=2; # we won't see sub-field's or field's end tag
       }
       else {
         $buf="";
-        $field=$evt->[1];
-        $field_evt=$evt;
+        $field=$token->[1];
+        $field_token=$token;
       }
     }
-    elsif ($t eq 't') {
-      $buf=$evt->[1] unless $evt->[1] =~ /^\s*$/;
+    elsif ($t eq 'T') {
+      $buf=$token->[1] unless $token->[1] =~ /^\s*$/;
     }
-    else { # must be end tag
-      last if $evt->[1] eq $rectype;
+    elsif ($t eq 'E') {
+      last if $token->[1] eq $rectype;
       add_hash($h,$field,$buf);
       --$nest;
     }
@@ -111,80 +83,102 @@ sub add_hash {
   $h->{$field}=$val;
 }
 
-
-sub next_evt {
+sub get_simple_tree {
   my $self=shift;
-  my $buf;
-  while (!@{$self->{output}} && !$self->{EOF}) {
-    if (exists $self->{src}) {
-      $buf=substr(${$self->{src}},$self->{src_offset},4096);
-      $self->{src_offset}+=4096;
+  return undef unless ($self->skip_to(@_));
+  my $lists=[];
+  my $tree=[];
+  my $curlist=$tree;
+  my $top='';
+  while (my $token=$self->get_token()) {
+    my $type=$token->[0];
+    if ($type eq 'S') {
+      my $newlist=[];
+      my $newnode={type=>'e',attrib=>$token->[2],name=>$token->[1],content=>$newlist};
+      push @$lists, $curlist;
+      push @$curlist,$newnode;
+      $curlist=$newlist;
+      $top||=$token->[1];
     }
-    else {
-      read($self->{srcfile},$buf,4096);
+    elsif ($type eq 'E') {
+      $curlist=pop @$lists;
+      last if $token->[1] eq $top;
     }
-    if (length($buf)==0) {
-      $self->{EOF}=1;
-      $self->{parser}->parse_done();
+    elsif ($type eq 'T') {
+      push @$curlist,{type=>'t',content=>$token->[1]};
     }
-    else {
-      $self->{parser}->parse_more($buf);
+    elsif ($type eq 'PI') {
+      push @$curlist,{type=>'p',target=>$token->[1],content=>$token->[2]};
     }
   }
-  return shift(@{$self->{output}});
+ $tree->[0];
 }
 
-sub pushback {
-  my ($self,$evt)=@_;
-  unshift @{$self->{output}},$evt;
-}
-
-sub start {
-  my ($parser,$element,@attrs)=@_;
-  my $self=$parser->{Records};
-  push @{$self->{output}},['s',$self->nsname($element)];
-  while (@attrs) {
-    my ($name,$val)=(shift @attrs,shift @attrs);
-    push @{$self->{output}[-1]},$self->nsname($name),$self->encode($val);
+sub drive_SAX {
+  my $self=shift;
+  my $handler=shift;
+  my $wrap=1;
+  if (@_ && ref($_[0]) eq 'HASH' && defined $_[0]->{wrap}) {
+    $wrap=$_[0]->{wrap};
   }
-}
-
-sub end {
-  my ($parser,$element)=@_;
-  my $self=$parser->{Records};
-  push @{$self->{output}},['e',$self->nsname($element)];
-}
-
-sub char {
-  my ($parser,$text)=@_;
-  my $self=$parser->{Records};
-  unless (@{$self->{output}} && $self->{output}[-1][0] eq 't') {
-    push @{$self->{output}},['t',""];
+  return undef unless ($self->skip_to(@_));
+  my $top='';
+  $handler->start_document({}) if $wrap;
+  while (my $token=$self->get_token()) {
+    my $type=$token->[0];
+    if ($type eq 'S') {
+      $handler->start_element({Attributes=>$token->[2],Name=>$token->[1]});
+      $top||=$token->[1];
+    }
+    elsif ($type eq 'E') {
+      $handler->end_element({Name=>$token->[1]});
+      last if $token->[1] eq $top;
+    }
+    elsif ($type eq 'T') {
+      $handler->characters({Data=>$token->[1]});
+    }
+    elsif ($type eq 'PI') {
+      $handler->processing_instruction({Target=>$token->[1],Data=>$token->[2]});
+    }
   }
-  $self->{output}[-1][1].=$self->encode($text);
+  $wrap? $handler->end_document({}): 1;
 }
 
-sub nsname {
-  my ($self,$name)=@_;
-  my $parser=$self->{parser};
-  if ($parser->{Namespaces}) {
-    my $ns=$parser->namespace($name)||'';
-    $name="{$ns}$name";
+sub skip_to {
+  my $self=shift;
+  my $here=0;
+  if (@_ && ref($_[0]) eq 'HASH') {
+    my $opts=shift;
+    $here ||= $opts->{here};
   }
-  return $self->encode($name);    
+  my $token;
+  push @{$self->{rectypes}},{%{$self->{rectypes}[-1]}};
+  $self->set_records(@_) if @_;
+
+  if ($here) { # next non-comment token must be start of record
+    my $found=0;
+    while (($token=$self->get_token()) && $token->[0] eq 'C') {
+      ;
+    }
+    $found=($token && $token->[0] eq 'S'
+            && (!keys(%{$self->{rectypes}[-1]})
+                || $self->{rectypes}[-1]{$token->[1]})
+           );
+    $self->unget_token($token) if $token;
+    $token=$found;
+  }
+  else { # skip to start of record
+    while ($token=$self->get_token()) {
+      next unless $token->[0] eq 'S';
+      next unless !keys(%{$self->{rectypes}[-1]}) || $self->{rectypes}[-1]{$token->[1]};
+      $self->unget_token($token);
+      last;
+    }
+  } 
+  pop @{$self->{rectypes}};
+  $token;
 }
 
-sub encode {
-  my ($self,$text)=@_;
-  if ($self->{latin}) {
-    $text=~s{([\xc0-\xc3])(.)}{
-      my $hi = ord($1);
-      my $lo = ord($2);
-      chr((($hi & 0x03) <<6) | ($lo & 0x3F))
-     }ge;
-  }
-  return $text;
-}
 1;
 __END__
 
@@ -207,58 +201,55 @@ XML::Records - Perlish record-oriented interface to XML
 
 =head1 DESCRIPTION
 
-XML::Records provides a simple interface for reading "record-structured" 
-XML documents, that is, documents in which the immediate children of the 
-root element form a sequence of identical and independent sub-elements such 
-as log entries, transactions, etc., each of which consists of "field" child 
-elements or attributes.  XML::Records allows you to access each record as a 
-simple Perl hash.
+XML::Records provides a single interface for processing XML data on a 
+stream-oriented, tree-oriented, or record-oriented basis.  A subclass of 
+XML::TokeParser, it adds methods to read "records" and tree fragments from 
+XML documents.
+
+In many documents, the immediate children of the root element form a 
+sequence of identically-named and independent elements such as log entries, 
+transactions, etc., each of which consists of "field" child elements or 
+attributes.  You can access each such "record" as a simple Perl hash.
+
+You can also read any element and its children into a lightweight tree 
+implemented as a Perl hash, or feed the contents of any element and its
+children into a SAX handler (making it possible to process "records" with
+modules like XML::DOM or XML::XPath).
 
 =head1 METHODS
 
 =over 4
 
-=item $reader=XML::Records->new(source, [options]);
+=item $parser=XML::Records->new(source, [options]);
 
-Creates a new reader object
+Creates a new parser object
 
-I<source> is either a reference to a string containing the XML, the name of 
-a file containing the XML, or an open IO::Handle or filehandle glob 
-reference from which the XML can be read.
+I<source> and I<options> are the same as for XML::TokeParser. I<source> is 
+either a reference to a string containing the XML, the name of a file 
+containing the XML, or an open IO::Handle or filehandle glob reference from 
+which the XML can be read.
 
-The I<Option>s can be any options allowed by XML::Parser and 
-XML::Parser::Expat, as well as two module-specific options:
+=item $parser->set_records(name [,name]*);
 
-=over 4
+Specifies what XML element-type names enclose records.  If a name is
+prefixed with '-' then the reader will treat a start-tag for that name as
+indicating the end of a record.
 
-=item I<Latin>
-
-If set to a true value, causes Unicode characters in the range 128-255 to 
-be returned as ISO-Latin-1 characters rather than UTF-8 characters.
-
-=item I<Catalog>
-
-Specifies the URL of a catalog to use for resolving public identifiers and 
-remapping system identifiers used in document type declarations or external 
-entity references.  This option requires XML::Catalog to be installed.
-
-=back
-
-=item $reader->set_records(name [,name]*);
-
-Specifies what XML element-type names enclose records.
-
-=item ($type,$record)=$reader->get_record([name [,name]*]);
+=item ($type,$record)=$parser->get_record([{options}] [name [,name]*]);
 
 Retrieves the next record from the input, skipping through the XML input 
 until it encounters a start tag for one of the elements that enclose 
-records.  If arguments are given, they will temporarily replace the set of 
-record-enclosing elements.  The method will return a list consisting of the 
-name of the record's enclosing element and a reference to a hash whose keys 
-are the names of the record's child elements ("fields") and whose values 
-are the fields' contents (if called in scalar context, the return value 
-will be the hash reference).  Both elements of the list will be undef if no 
-record can be found.
+records.  If the first argument is a hash reference and the value of the 
+key 'here' is set to a non-zero value, then non-comment tokens will not be 
+skipped and the method will return (undef,undef) if the next token is not a 
+start tag for a record-enclosing element (the token will be pushed back in 
+this case).  If arguments are given, they will temporarily replace the set 
+of record-enclosing elements.  The method will return a list consisting of 
+the name of the record's enclosing element and a reference to a hash whose 
+keys are the names of the record's child elements ("fields") and whose 
+values are the fields' contents (if called in scalar context, the return 
+value will be the hash reference).  Both elements of the list will be undef 
+if no record can be found.
 
 If a field's content is plain text, its value will be that text.
 
@@ -280,12 +271,40 @@ elements which in turn contain <address> elements that include further
 elements, then calling get_record with the record type set to "address" 
 will return the contents of each <address> element.
 
+=item $tree=$parser->get_simple_tree([{options}] [name [,name]*]);
+
+Returns a lightweight tree rooted at the next element whose name is listed 
+in the arguments, or at the next start-tag token if no arguments are given, 
+skipping over any intermediate tokens unless the 'here' option is set as in 
+get_record().
+
+The return value is a hash reference to the root node of the tree.  Each 
+node is a hash with a 'type' key whose value is the node's type: 'e' for 
+elements, 't' for text, and 'p' for processing instructions; and a 
+'content' key whose value is a reference to an array of the element's 
+child nodes for element nodes, the string value for text nodes, and the 
+data value for processing instruction nodes.  Element nodes also have an 
+'attrib' key whose value is a reference to a hash of attribute names and 
+values.  Processing instructions also have a 'target' key whose value is 
+the PI's target.
+
+=item $result=$parser->drive_SAX(handler, [{options},[name [,name]*]);
+
+Skips to the next element whose names is listed in the arguments, or the 
+next element if no arguments are given, and generates PerlSAX events which 
+are sent to the SAX handler object in handler as if the element were an 
+entire document. The return value is whatever the handler returned in 
+response to the end_document event.  If the 'here' option is set, returns 
+undef without generating any SAX events if the next non-comment token is 
+not a start tag for a record-enclosing element.  If the 'wrap' option is 
+set to 0, does not generate start_document or end_document events and 
+returns 1.
+
 =back
 
-=head1 EXAMPLE
+=head1 EXAMPLES
 
-Print a list of package names from a (rather out-of-date) list of XML 
-modules:
+=head2 Print a list of package names from a (rather out-of-date) list of XML modules:
 
  #!perl -w
  use strict;
@@ -305,19 +324,45 @@ modules:
    }
  }
 
+=head2 Extract interesting items from an RSS 0.91 file
+
+ #!perl -w
+ use strict;
+ use XML::Records;
+ use XML::Handler::YAWriter;
+
+ my $r=XML::Records->new('messages.rss');
+ $r->set_records('item');
+ my $h=XML::Handler::YAWriter->new(AsString=>1);
+ $h->start_document({});
+ $h->start_element({Name=>'items'});
+ while (my $t=$r->get_tag('item')) {
+   $r->unget_token($t);
+   $r->begin_saving();
+   my $text=$r->get_text('/item');
+   if ($text=~/perl/i) {
+     $r->restore_saved();
+     $r->drive_SAX($h,{wrap=>0,here=>1});
+   }
+ }
+ $h->end_element({Name=>'items'});
+ print $h->end_document({});
+
 =head1 RATIONALE
 
 XML::RAX, which implements the proposed RAX standard for record-oriented 
-XML access, does most of what XML::Records does, but its interface is not 
-very Perlish (due to the fact that RAX is a language-independent interface) 
-and it cannot cope with fields that have sub-structure (because RAX itself 
-doesn't address the issue).
+XML access, does much of what XML::Records does but its interface is not 
+very Perlish (due to the fact that RAX is a language-independent 
+interface), it cannot cope with fields that have sub-structure (because RAX 
+itself doesn't address the issue), and it doesn't allow mixing record- 
+oriented and non-record-oriented operations.
 
-XML::Simple can do everything that XML::Records does, at the expense of 
-reading the entire document into memory.  XML::Records will read the entire 
-document into a single hash if you set the root element as a record type, 
-but you're really better off using XML::Simple in that case as it's 
-optimized for such usage.
+XML::Twig allows access to tree fragments, but only on a "push" (callback- 
+driven) basis, and does not allow mixed tree- and token-level access.
+
+=head1 PREREQUISITES
+
+XML::TokeParser (version 0.03 or higher), XML::Parser.
 
 =head1 AUTHOR
 
@@ -332,11 +377,10 @@ same terms as Perl itself.
 
 =head1 SEE ALSO
 
-  XML::Parser
+  XML::TokeParser
   XML::RAX
-  XML::Simple
-  XML::Catalog
+  XML::Twig
+  XML::Parser::PerlSAX
   perl(1).
 
 =cut
-

@@ -4,4 +4,5 @@ use ExtUtils::MakeMaker;
 WriteMakefile(
     'NAME'	=> 'XML::Records',
     'VERSION_FROM' => 'Records.pm', # finds $VERSION
+    'PREREQ_PM' => {XML::TokeParser => '0.03'},
 );
